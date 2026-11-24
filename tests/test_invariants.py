@@ -12,11 +12,14 @@ These are the requirements that are easy to *claim* but easy to get wrong:
 
 from __future__ import annotations
 
+import json
 import re
+import sqlite3
 
 import pytest
+from fastapi.testclient import TestClient
 
-from app import db, repository
+from app import db, repository, main
 
 
 class SqlRecorder:
@@ -159,6 +162,163 @@ def test_span_index_skips_summaries_outside_the_window(client):
     body = response.json()
     assert body["total_individuals"] == 0
     assert body["summary_rows_used"] == 0
+
+
+def test_gap_between_two_days_does_not_use_summary_budget(client):
+    """A tag seen on 3/1 and 3/3 is absent from 3/2 and must cost no budget.
+
+    Its stored span covers 3/2, but it has no day inside that window, so the
+    one-day count stays 0 and no summary record is consumed.
+    """
+    put = client.post
+    for rid, day in (("A", "2026-03-01"), ("B", "2026-03-03")):
+        put(
+            "/observations",
+            json={
+                "recognition_id": rid,
+                "observed_on": day,
+                "district": "北沟片区",
+                "ear_tag": "ET-1",
+            },
+        )
+
+    body = client.get(
+        "/stats/districts/北沟片区",
+        params={"start_date": "2026-03-02", "end_date": "2026-03-02"},
+    ).json()
+    assert body["one_day_count"] == 0
+    assert body["multi_day_count"] == 0
+    assert body["summary_rows_used"] == 0
+
+    # Sanity check: without the gap it is a single-day individual.
+    common = client.get(
+        "/stats/districts/北沟片区",
+        params={"start_date": "2026-03-01", "end_date": "2026-03-01"},
+    ).json()
+    assert common["one_day_count"] == 1
+    assert common["summary_rows_used"] == 1
+
+    all_body = client.get(
+        "/stats/districts",
+        params={"start_date": "2026-03-02", "end_date": "2026-03-02"},
+    ).json()
+    assert all_body["total_summary_rows_used"] == 0
+    assert all_body["districts"] == []
+
+
+def test_gap_only_summaries_do_not_count_towards_the_cap(client):
+    """1025 tags that straddle the window without appearing in it still pass.
+
+    Each tag is seen on 3/1 and 3/3, so every stored span covers 3/2.  Querying
+    only 3/2 must return no individuals and must not hit the 1024 cap.
+    """
+    with db.write_transaction() as conn:
+        for i in range(repository.MAX_SUMMARY_ROWS + 1):
+            repository._add_day(conn, "北沟片区", f"ET-{i}", "2026-03-01")
+            repository._add_day(conn, "北沟片区", f"ET-{i}", "2026-03-03")
+
+    response = client.get(
+        "/stats/districts/北沟片区",
+        params={"start_date": "2026-03-02", "end_date": "2026-03-02"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total_individuals"] == 0
+    assert body["summary_rows_used"] == 0
+
+    # The wider window really does contain all 1025 combinations.
+    crowded = client.get(
+        "/stats/districts/北沟片区",
+        params={"start_date": "2026-03-01", "end_date": "2026-03-03"},
+    )
+    assert crowded.status_code == 422
+
+
+def test_cap_counts_only_in_range_combinations(client):
+    """Exactly 1024 in-range tags pass even with extra out-of-range tags present."""
+    with db.write_transaction() as conn:
+        for i in range(repository.MAX_SUMMARY_ROWS):
+            repository._add_day(conn, "北沟片区", f"ET-{i}", "2026-03-02")
+        for i in range(100):
+            repository._add_day(conn, "北沟片区", f"OUT-{i}", "2026-03-01")
+            repository._add_day(conn, "北沟片区", f"OUT-{i}", "2026-03-03")
+
+    response = client.get(
+        "/stats/districts/北沟片区",
+        params={"start_date": "2026-03-02", "end_date": "2026-03-02"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["summary_rows_used"] == 1024
+    assert body["one_day_count"] == 1024
+
+
+def test_day_index_is_backfilled_for_an_existing_volume(tmp_path, monkeypatch):
+    """A database created without the day index gets it on the first upgrade."""
+    path = str(tmp_path / "legacy.db")
+    legacy_schema = """
+    CREATE TABLE observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recognition_id TEXT NOT NULL UNIQUE,
+        ear_tag TEXT NOT NULL,
+        district TEXT NOT NULL,
+        observed_on TEXT NOT NULL,
+        committed INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
+    CREATE TABLE tag_summaries (
+        district TEXT NOT NULL,
+        ear_tag TEXT NOT NULL,
+        committed INTEGER NOT NULL DEFAULT 1,
+        first_observed_on TEXT NOT NULL,
+        last_observed_on TEXT NOT NULL,
+        day_counts TEXT NOT NULL,
+        PRIMARY KEY (district, ear_tag, committed)
+    ) WITHOUT ROWID;
+    CREATE TABLE app_meta (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+    ) WITHOUT ROWID;
+    INSERT INTO app_meta (key, value) VALUES ('state_version', 0);
+    INSERT INTO tag_summaries
+        (district, ear_tag, committed, first_observed_on,
+         last_observed_on, day_counts)
+    VALUES ('北沟片区', 'ET-1', 1, '2026-03-01', '2026-03-03',
+            '[["2026-03-01",1],["2026-03-03",2]]');
+    INSERT INTO observations
+        (recognition_id, observed_on, district, ear_tag, committed)
+    VALUES ('A', '2026-03-01', '北沟片区', 'ET-1', 1),
+           ('B', '2026-03-03', '北沟片区', 'ET-1', 1),
+           ('C', '2026-03-03', '北沟片区', 'ET-1', 1);
+    """
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(legacy_schema)
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("DB_PATH", path)
+    db.configure_db(path)
+    try:
+        db.init_db()
+
+        with TestClient(main.app) as client:
+            gap = client.get(
+                "/stats/districts/北沟片区",
+                params={"start_date": "2026-03-02", "end_date": "2026-03-02"},
+            ).json()
+            assert gap["summary_rows_used"] == 0
+            assert gap["total_individuals"] == 0
+
+            wider = client.get(
+                "/stats/districts/北沟片区",
+                params={"start_date": "2026-03-01", "end_date": "2026-03-03"},
+            ).json()
+            assert wider["multi_day_count"] == 1
+            assert wider["summary_rows_used"] == 1
+    finally:
+        db.configure_db(None)
 
 
 # ---------------------------------------------------------------------------

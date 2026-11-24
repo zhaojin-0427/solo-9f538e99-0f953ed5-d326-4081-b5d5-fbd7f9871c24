@@ -180,7 +180,10 @@ class DistrictStats(BaseModel):
         description="区间内出现过的耳标个体数，等于前两项之和"
     )
     summary_rows_used: int = Field(
-        description="本次统计读取的日汇总记录数；超过 1024 条时拒绝查询"
+        description=(
+            "本次统计实际命中的 片区/耳标 组合数（区间内至少有一天）；"
+            "仅在区间外出现的耳标不计入，超过 1024 条时拒绝查询"
+        )
     )
     state_version: int = Field(description="本次读取所依据的已提交状态版本号")
 
@@ -198,7 +201,10 @@ class AllDistrictStats(BaseModel):
     start_date: date
     end_date: date
     total_summary_rows_used: int = Field(
-        description="所有片区合计读取的日汇总记录数；超过 1024 条时拒绝查询"
+        description=(
+            "所有片区合计实际命中的 片区/耳标 组合数；"
+            "仅在区间外出现的耳标不计入，超过 1024 条时拒绝查询"
+        )
     )
     total_one_day_count: int = Field(description="所有片区只一天个体数合计")
     total_multi_day_count: int = Field(description="所有片区至少两天个体数合计")

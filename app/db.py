@@ -13,8 +13,17 @@ Storage layout
     so several captures of one ear tag in one district on one day are already
     collapsed to a single day at write time: statistics never merge photos or
     days at query time.
-    ``first_observed_on`` / ``last_observed_on`` let a range query skip
-    summary records that cannot overlap the requested window.
+    ``first_observed_on`` / ``last_observed_on`` bound the stored days.
+
+``tag_summaries_days``
+    A normalized day index: one row per ``(district, ear_tag, day)`` actually
+    observed.  It is maintained in the same transaction as ``tag_summaries``.
+    A statistics query probes this index directly for the requested days, so
+    a tag whose days are all outside the window is never visited -- even when
+    its first/last span happens to cover the window (for example a tag seen on
+    3/1 and 3/3 queried for 3/2).  The 1024-record budget therefore counts
+    only the distinct ``(district, ear_tag)`` combinations that really have a
+    day inside the window.
 
 ``app_meta``
     A monotonically increasing ``state_version``, bumped once per successful
@@ -39,6 +48,7 @@ so no query can observe a half-applied write.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -105,6 +115,17 @@ CREATE TABLE IF NOT EXISTS tag_summaries (
     PRIMARY KEY (district, ear_tag, committed)
 ) WITHOUT ROWID;
 
+-- Normalized day index: one row per (district, ear_tag, day) that was really
+-- observed.  It lets a statistics query find the combinations that have a day
+-- inside the window without touching summaries whose days are all outside it.
+CREATE TABLE IF NOT EXISTS tag_summaries_days (
+    district   TEXT    NOT NULL,
+    ear_tag    TEXT    NOT NULL,
+    committed  INTEGER NOT NULL DEFAULT 1 CHECK (committed IN (0, 1)),
+    day        TEXT    NOT NULL,               -- ISO date, YYYY-MM-DD
+    PRIMARY KEY (district, ear_tag, committed, day)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS app_meta (
     key             TEXT    PRIMARY KEY,
     value           INTEGER NOT NULL
@@ -124,6 +145,13 @@ CREATE INDEX IF NOT EXISTS idx_summaries_district_span
     ON tag_summaries (district, committed, first_observed_on, last_observed_on, ear_tag);
 CREATE INDEX IF NOT EXISTS idx_summaries_span
     ON tag_summaries (committed, first_observed_on, last_observed_on, district, ear_tag);
+
+-- The window query probes the day index first; these orders let it walk only
+-- the requested days, either globally or within one district.
+CREATE INDEX IF NOT EXISTS idx_summary_days_window
+    ON tag_summaries_days (committed, day, district, ear_tag);
+CREATE INDEX IF NOT EXISTS idx_summary_days_district_window
+    ON tag_summaries_days (district, committed, day, ear_tag);
 """
 
 
@@ -138,6 +166,46 @@ def _connect(path: str) -> sqlite3.Connection:
     return conn
 
 
+def _backfill_day_index(conn: sqlite3.Connection) -> None:
+    """Populate ``tag_summaries_days`` from summaries written before it existed.
+
+    Older volumes only have ``tag_summaries``; the normalized day index is
+    derived from each summary's ``day_counts`` array.  The migration is
+    idempotent, runs once per database (guarded by an ``app_meta`` marker) and
+    commits in one transaction, so the first statistics query after an upgrade
+    already sees the new index.
+    """
+    row = conn.execute(
+        "SELECT value FROM app_meta WHERE key = 'day_index_version'"
+    ).fetchone()
+    if row is not None and int(row["value"]) >= 1:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO tag_summaries_days
+                (district, ear_tag, committed, day)
+            SELECT s.district, s.ear_tag, s.committed,
+                   json_extract(entry.value, '$[0]')
+            FROM tag_summaries AS s, json_each(s.day_counts) AS entry
+            WHERE s.committed = 1
+              AND json_extract(entry.value, '$[0]') IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO app_meta (key, value) VALUES ('day_index_version', 1)
+            ON CONFLICT (key) DO UPDATE SET value = excluded.value
+            """
+        )
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
 def init_db(path: str | None = None) -> None:
     """Create the database file and schema if needed.  Idempotent."""
     target = path or get_db_path()
@@ -149,6 +217,7 @@ def init_db(path: str | None = None) -> None:
         # a lock and could fail while another connection is writing.
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        _backfill_day_index(conn)
     finally:
         conn.close()
 

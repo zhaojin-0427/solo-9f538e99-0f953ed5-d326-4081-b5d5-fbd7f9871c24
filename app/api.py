@@ -238,11 +238,13 @@ def _stats_http_error(exc: Exception) -> HTTPException:
     summary="按片区与起止日统计只在一天 / 至少两天被拍到的个体数",
     description=(
         "起止日均包含。同一片区内同一耳标同一天被拍到多次只算一天。"
-        "统计只读取汇总记录（每个 片区/耳标 一条，天内次数已在写入时归并），"
-        "不读取识别明细，也不在查询时逐日归并；单次查询最多访问 1024 条汇总记录，"
-        "超出时返回 422 而不是截断结果。"
+        "统计只读取汇总记录（每个 片区/耳标 一条，天内次数已在写入时归并）"
+        "及其按天的命中索引，不读取识别明细，也不在查询时逐日归并。"
+        "1024 条上限只计区间内实际出现过的 片区/耳标 组合：仅在区间外出现的"
+        "耳标（例如只在 3-01 和 3-03 被拍到、查询 3-02）不计入上限也不计为个体；"
+        "超过 1024 个区间内组合时返回 422 而不是截断结果。"
     ),
-    responses={422: {"description": "日期范围不合法或超出汇总记录上限"}},
+    responses={422: {"description": "日期范围不合法或区间内组合数超过 1024"}},
 )
 def district_stats(
     district: Annotated[str, Path(min_length=1, description="片区")],
@@ -261,11 +263,12 @@ def district_stats(
     response_model=AllDistrictStats,
     summary="按起止日统计所有片区的只在一天 / 至少两天个体数",
     description=(
-        "起止日均包含。逐片区返回两项个体数。所有片区合计最多访问 "
-        "1024 条汇总记录，超出时返回 422。"
+        "起止日均包含。逐片区返回两项个体数。1024 条上限只计区间内实际"
+        "出现过的 片区/耳标 组合，仅在区间外出现的耳标不计入上限，"
+        "超过 1024 个区间内组合时返回 422。"
         "可用 `district` 参数只保留一个片区，此时与按片区接口口径一致。"
     ),
-    responses={422: {"description": "日期范围不合法或超出汇总记录上限"}},
+    responses={422: {"description": "日期范围不合法或区间内组合数超过 1024"}},
 )
 def all_district_stats(
     start_date: StartDate,
@@ -287,7 +290,7 @@ def all_district_stats(
         "`/stats/districts` 的等价入口：起止日均包含，"
         "可只传一个片区，也可查询全部片区。"
     ),
-    responses={422: {"description": "日期范围不合法或超出汇总记录上限"}},
+    responses={422: {"description": "日期范围不合法或区间内组合数超过 1024"}},
 )
 def stats(
     start_date: StartDate,

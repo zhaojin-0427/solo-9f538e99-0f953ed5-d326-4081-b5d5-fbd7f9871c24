@@ -14,16 +14,25 @@ same ear tag in the same district on the same day are already collapsed at
 write time: the "same day counts once" rule is applied on the way in, so a
 statistics query never merges photos or days.
 
+``tag_summaries_days`` -- the normalized day index, one row per
+``(district, ear_tag, day)`` really observed, maintained in the same
+transaction.  A window query probes this index, so it visits only combinations
+that have a day inside the window.  In particular, a tag seen on 3/1 and 3/3
+is not visited at all when querying 3/2, even though its first/last span
+covers that day.
+
 Key guarantees
 --------------
 * Detail and summary change in the same transaction.  A failure rolls both
   back, so reads keep seeing the old numbers.
-* Statistics read ``tag_summaries`` only.  They never touch ``observations``
-  and never group by day at query time; the number of observed days inside an
-  arbitrary window is two binary searches over the stored sorted days.
-* One statistics query fetches at most ``MAX_SUMMARY_ROWS`` summary records in
-  a single statement.  If the range really needs more, it returns
-  ``SummaryLimitExceeded`` rather than a truncated answer.
+* Statistics read ``tag_summaries`` and ``tag_summaries_days`` only.  They
+  never touch ``observations`` and never group by day at query time; the
+  number of observed days inside an arbitrary window is two binary searches
+  over the stored sorted days.
+* One statistics query visits at most ``MAX_SUMMARY_ROWS`` distinct
+  ``(district, ear_tag)`` combinations that really have a day inside the
+  window.  If the range really needs more, it returns ``SummaryLimitExceeded``
+  rather than a truncated answer.
 * A correction reads one detail row (by unique key) plus at most two summary
   records (old and new district/ear-tag scope).  The number of observation
   rows read is constant and does not grow with the ear tag's history.
@@ -154,12 +163,35 @@ def _save_summary(conn, district: str, ear_tag: str, entries: list[list[Any]]) -
     )
 
 
+def _index_day(conn, district: str, ear_tag: str, day: str) -> None:
+    """Add one observed day to the normalized range-hit index."""
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO tag_summaries_days
+            (district, ear_tag, committed, day)
+        VALUES (?, ?, 1, ?)
+        """,
+        (district, ear_tag, day),
+    )
+
+
+def _unindex_day(conn, district: str, ear_tag: str, day: str) -> None:
+    """Remove one observed day from the normalized range-hit index."""
+    conn.execute(
+        """
+        DELETE FROM tag_summaries_days
+        WHERE district = ? AND ear_tag = ? AND committed = 1 AND day = ?
+        """,
+        (district, ear_tag, day),
+    )
+
+
 def _add_day(conn, district: str, ear_tag: str, day: str) -> None:
     """Record one identification in one summary record.
 
-    Only the ``(district, ear_tag)`` summary row is read and written.  A day
-    already present is incremented in place, so another capture on the same
-    day never creates another day.
+    Only the ``(district, ear_tag)`` summary row and its day-index entry are
+    read and written.  A day already present is incremented in place, so
+    another capture on the same day never creates another day.
     """
     row = _load_summary(conn, district, ear_tag)
     entries = _parse_days(row["day_counts"]) if row is not None else []
@@ -169,6 +201,7 @@ def _add_day(conn, district: str, ear_tag: str, day: str) -> None:
     else:
         entries.insert(pos, [day, 1])
     _save_summary(conn, district, ear_tag, entries)
+    _index_day(conn, district, ear_tag, day)
 
 
 def _remove_day(conn, district: str, ear_tag: str, day: str) -> None:
@@ -183,6 +216,7 @@ def _remove_day(conn, district: str, ear_tag: str, day: str) -> None:
     entries[pos][1] -= 1
     if entries[pos][1] <= 0:
         del entries[pos]
+        _unindex_day(conn, district, ear_tag, day)
     _save_summary(conn, district, ear_tag, entries)
 
 
@@ -390,44 +424,53 @@ def _validate_range(start_date: date, end_date: date) -> None:
 
 
 def _summary_page(conn, district: str | None, start_date: date, end_date: date):
-    """Fetch the summary records that can overlap the window.
+    """Fetch the summary records that really have a day inside the window.
 
-    Only summary records are read.  The span columns let SQLite skip records
-    wholly before or after the window, and the data query itself is capped at
-    ``MAX_SUMMARY_ROWS`` rows.  Only when that cap is reached may a single
-    existence probe run one row deeper; if it finds anything, the query is
-    rejected instead of silently returning a truncated answer.
+    The normalized day index is probed first: only ``(district, ear_tag)``
+    combinations with at least one observed day in ``[start, end]`` can match.
+    A tag whose days are entirely outside the window is never visited, even
+    when its first/last span covers the window.  Consequently the cap counts
+    actual in-range combinations, and ``summary_rows_used`` reports exactly
+    how many were used.
+
+    At most ``MAX_SUMMARY_ROWS`` summary records are fetched.  Only when that
+    cap is reached may a single existence probe run one combination deeper;
+    if it finds anything, the query is rejected instead of silently returning
+    a truncated answer.
     """
     start, end = start_date.isoformat(), end_date.isoformat()
-    where = "committed = 1 AND last_observed_on >= ? AND first_observed_on <= ?"
-    if district is None:
-        params: list[Any] = [start, end]
-    else:
-        where = (
-            "committed = 1 AND district = ? AND last_observed_on >= ? "
-            "AND first_observed_on <= ?"
-        )
-        params = [district, start, end]
+    day_where = "committed = 1 AND day >= ? AND day <= ?"
+    day_params: list[Any] = [start, end]
+    if district is not None:
+        day_where = "district = ? AND " + day_where
+        day_params = [district, start, end]
 
     rows = conn.execute(
         f"""
         SELECT district, ear_tag, first_observed_on, last_observed_on,
                day_counts
         FROM tag_summaries
-        WHERE {where}
+        WHERE committed = 1 AND (district, ear_tag) IN (
+            SELECT DISTINCT district, ear_tag
+            FROM tag_summaries_days
+            WHERE {day_where}
+        )
         LIMIT ?
         """,
-        [*params, MAX_SUMMARY_ROWS],
+        [*day_params, MAX_SUMMARY_ROWS],
     ).fetchall()
 
     if len(rows) == MAX_SUMMARY_ROWS:
         overflow = conn.execute(
             f"""
-            SELECT 1 FROM tag_summaries
-            WHERE {where}
-            LIMIT 1 OFFSET ?
+            SELECT 1 FROM (
+                SELECT DISTINCT district, ear_tag
+                FROM tag_summaries_days
+                WHERE {day_where}
+                LIMIT 1 OFFSET ?
+            )
             """,
-            [*params, MAX_SUMMARY_ROWS],
+            [*day_params, MAX_SUMMARY_ROWS],
         ).fetchone()
         if overflow is not None:
             raise SummaryLimitExceeded(MAX_SUMMARY_ROWS)

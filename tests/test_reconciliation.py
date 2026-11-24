@@ -76,7 +76,30 @@ def test_random_history_matches_brute_force(db_path):
             )
 
     with db.read_transaction() as conn:
-        for start_offset, end_offset in ((0, 13), (0, 6), (7, 13), (3, 3), (5, 8)):
+        index = conn.execute(
+            """
+            SELECT district, ear_tag, day
+            FROM tag_summaries_days
+            WHERE committed = 1
+            """
+        ).fetchall()
+        expected_index = {
+            (row["district"], row["ear_tag"], row["observed_on"])
+            for row in conn.execute(
+                """
+                SELECT district, ear_tag, observed_on
+                FROM observations
+                WHERE committed = 1
+                """
+            ).fetchall()
+        }
+    actual_index = {(r["district"], r["ear_tag"], r["day"]) for r in index}
+    assert actual_index == expected_index
+
+    with db.read_transaction() as conn:
+        for start_offset, end_offset in (
+            (0, 13), (0, 6), (7, 13), (3, 3), (5, 8), (1, 1), (2, 4), (9, 12)
+        ):
             start = START + timedelta(days=start_offset)
             end = START + timedelta(days=end_offset)
             expected = _brute_force(conn, start, end)
@@ -85,6 +108,7 @@ def test_random_history_matches_brute_force(db_path):
                 want = expected.get(district, {"one": 0, "multi": 0})
                 assert got["one_day_count"] == want["one"], (district, start, end)
                 assert got["multi_day_count"] == want["multi"], (district, start, end)
+                assert got["summary_rows_used"] == want["one"] + want["multi"]
 
 
 def test_random_history_all_district_totals_match(db_path):
